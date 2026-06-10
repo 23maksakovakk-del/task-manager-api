@@ -1,0 +1,79 @@
+// User.java
+@Entity
+public class User {
+    @Id @GeneratedValue private Long id;
+    private String email, name, password, role;
+    // getters/setters
+}
+
+// Task.java
+@Entity
+public class Task {
+    @Id @GeneratedValue private Long id;
+    private String title, description, status;
+    private Long assignedTo, createdBy;
+}
+
+// JwtUtil.java – генерация и валидация токенов
+@Component
+public class JwtUtil {
+    private final String SECRET = "secret";
+    public String generateToken(String username, String role) {
+        return Jwts.builder()
+            .setSubject(username)
+            .claim("role", role)
+            .setExpiration(new Date(System.currentTimeMillis() + 86400000))
+            .signWith(SignatureAlgorithm.HS256, SECRET)
+            .compact();
+    }
+    public Claims extractClaims(String token) { /* ... */ }
+}
+
+// AuthController.java
+@RestController
+@RequestMapping("/auth")
+public class AuthController {
+    @Autowired private UserRepository userRepo;
+    @Autowired private PasswordEncoder encoder;
+    @Autowired private JwtUtil jwtUtil;
+    @PostMapping("/register")
+    public User register(@RequestBody UserDto dto) {
+        User u = new User();
+        u.setEmail(dto.getEmail());
+        u.setName(dto.getName());
+        u.setPassword(encoder.encode(dto.getPassword()));
+        u.setRole("user");
+        return userRepo.save(u);
+    }
+    @PostMapping("/login")
+    public Map<String, String> login(@RequestBody LoginDto dto) {
+        User u = userRepo.findByEmail(dto.getEmail());
+        if (u == null || !encoder.matches(dto.getPassword(), u.getPassword()))
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED);
+        String token = jwtUtil.generateToken(u.getEmail(), u.getRole());
+        return Map.of("token", token);
+    }
+}
+
+// TaskController.java
+@RestController
+@RequestMapping("/tasks")
+public class TaskController {
+    @GetMapping
+    public Page<Task> getTasks(@RequestParam(defaultValue="0") int page,
+                               @RequestParam(defaultValue="10") int size,
+                               @RequestParam(required=false) String status,
+                               @RequestHeader("Authorization") String auth,
+                               @Autowired TaskRepository taskRepo,
+                               @Autowired JwtUtil jwtUtil) {
+        String token = auth.substring(7);
+        Claims claims = jwtUtil.extractClaims(token);
+        String role = (String) claims.get("role");
+        Long userId = Long.valueOf(claims.getSubject()); // в subject храним id
+        Pageable pageable = PageRequest.of(page, size);
+        if ("admin".equals(role))
+            return taskRepo.findAllByStatus(status, pageable);
+        else
+            return taskRepo.findByAssignedToAndStatus(userId, status, pageable);
+    }
+}
