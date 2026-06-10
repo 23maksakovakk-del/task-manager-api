@@ -1,0 +1,46 @@
+use actix_web::{web, App, HttpServer, Responder, HttpResponse, middleware};
+use jsonwebtoken::{encode, decode, Header, Validation, EncodingKey, DecodingKey};
+use bcrypt::{hash, verify};
+use serde::{Serialize, Deserialize};
+use sqlx::PgPool;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    sub: i32,
+    role: String,
+    exp: usize,
+}
+
+async fn register(pool: web::Data<PgPool>, info: web::Json<RegisterReq>) -> impl Responder {
+    let hashed = hash(&info.password, 4).unwrap();
+    sqlx::query!("INSERT INTO users (email, name, password) VALUES ($1, $2, $3)",
+        info.email, info.name, hashed)
+        .execute(pool.get_ref()).await.unwrap();
+    HttpResponse::Created().finish()
+}
+
+async fn login(pool: web::Data<PgPool>, info: web::Json<LoginReq>) -> impl Responder {
+    let user = sqlx::query_as!(User, "SELECT id, email, password, role FROM users WHERE email = $1", info.email)
+        .fetch_one(pool.get_ref()).await.ok()?;
+    if verify(&info.password, &user.password).unwrap() {
+        let claims = Claims { sub: user.id, role: user.role, exp: 10000000000 };
+        let token = encode(&Header::default(), &claims, &EncodingKey::from_secret("secret".as_ref())).unwrap();
+        HttpResponse::Ok().json(json!({ "token": token }))
+    } else { HttpResponse::Unauthorized().finish() }
+}
+
+async fn get_tasks(pool: web::Data<PgPool>, req: HttpRequest, query: web::Query<Params>) -> impl Responder {
+    let auth = req.headers().get("Authorization").unwrap().to_str().unwrap();
+    let token = &auth[7..];
+    let token_data = decode::<Claims>(token, &DecodingKey::from_secret("secret".as_ref()), &Validation::default()).unwrap();
+    let is_admin = token_data.claims.role == "admin";
+    let user_id = token_data.claims.sub;
+    let tasks = if is_admin {
+        sqlx::query_as!(Task, "SELECT * FROM tasks WHERE ($1::text IS NULL OR status = $1) ORDER BY id LIMIT $2 OFFSET $3",
+            query.status, query.limit, (query.page-1)*query.limit).fetch_all(pool.get_ref()).await.unwrap()
+    } else {
+        sqlx::query_as!(Task, "SELECT * FROM tasks WHERE assigned_to = $1 AND ($2::text IS NULL OR status = $2) LIMIT $3 OFFSET $4",
+            user_id, query.status, query.limit, (query.page-1)*query.limit).fetch_all(pool.get_ref()).await.unwrap()
+    };
+    HttpResponse::Ok().json(tasks)
+}
